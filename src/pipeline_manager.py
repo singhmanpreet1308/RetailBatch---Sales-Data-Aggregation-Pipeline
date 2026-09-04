@@ -41,6 +41,17 @@ class PipelineManager:
             if not records:
                 logger.warning("No new transactions to process; pipeline run ending early.")
                 return outputs
+            if len(records) < config.MIN_BATCH_SIZE:
+                logger.warning(
+                    f"Batch contains {len(records)} transactions, below the "
+                    f"{config.MIN_BATCH_SIZE}-transaction target; processing "
+                    "continues so incremental Kafka messages are not discarded."
+                )
+            else:
+                logger.info(
+                    f"Batch-size target met: {len(records)} transactions "
+                    f"(minimum {config.MIN_BATCH_SIZE})."
+                )
             self.consumer.write_to_hdfs(records)
 
             # Step 2: batch-aggregate with PySpark and export CSV

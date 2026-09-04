@@ -46,8 +46,31 @@ The main components are:
 Install the Python dependencies:
 
 ```powershell
-pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
+
+Activate `.venv` whenever you open a new terminal. This keeps the pinned
+PySpark 3.5.6 dependency separate from other Python or Spark installations.
+
+## Fresh-start quick run
+
+From the project root, activate the environment, start Docker, verify Kafka,
+generate the 12,000-record dataset, and run the pipeline in this order:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+docker compose up -d
+docker compose ps
+Test-NetConnection localhost -Port 9092
+python scripts/generate_sample_data.py --target-records 12000 --seed 42
+python run_pipeline.py --produce
+```
+
+Continue to the Python commands only after `TcpTestSucceeded` is `True`. A
+successful run must say `Connected to Kafka broker`; if it says `Falling back
+to local simulation queue`, the records are not visible in Docker Kafka UI.
 
 ## Generate the sample data
 
@@ -60,30 +83,66 @@ worksheets:
 | `Dec_file` | December 2025   |
 | `Jan_file` | January 2026    |
 
-Run the generator with:
+The generator supports two modes. To reproduce the original 966 workbook
+rows, run:
 
 ```powershell
 python scripts/generate_sample_data.py
 ```
 
-The output is written to `sample_data/sales_transactions.json`.
+For the recommended pipeline demonstration, generate 12,000 realistic
+synthetic transaction events:
+
+```powershell
+python scripts/generate_sample_data.py --target-records 12000 --seed 42
+```
+
+The fixed seed makes the output reproducible. Both modes write to
+`sample_data/sales_transactions.json`, replacing its previous contents.
+
+### Synthetic-data method
+
+The 12,000-row dataset is synthetic data calibrated from the 966 source
+records; it must not be described as 12,000 original business records. The
+generator:
+
+- samples only products found in the source workbook;
+- retains each selected product's observed unit price and unit cost;
+- derives transaction quantities and the approximately 1.5% return rate from
+  the source quantity distribution;
+- gives products with more observed unit movement a higher selection weight;
+- creates realistic retail timestamps between 09:00 and 20:59, with moderately
+  higher Friday and weekend activity;
+- creates unique transaction IDs and no zero-quantity events; and
+- recalculates `cost_sales = quantity * unit_cost` and
+  `sales_value = quantity * price` for every generated event.
+
+December is assigned a transparent holiday-season volume increase. The
+default 12,000-record allocation is:
+
+| Month         | Synthetic transactions | Share    |
+| ------------- | ---------------------: | -------: |
+| November 2025 |                  3,600 |      30% |
+| December 2025 |                  5,040 |      42% |
+| January 2026  |                  3,360 |      28% |
+| **Total**     |             **12,000** | **100%** |
 
 ### Transaction field mapping
 
-| Transaction field  | Excel source or rule                                 |
-| ------------------ | ---------------------------------------------------- |
-| `transaction_id` | Generated sequential ID                              |
-| `timestamp`      | Worksheet year/month plus a distributed calendar day |
-| `store_id`       | `BELFAST`                                          |
-| `product_id`     | `Stock Code`                                       |
-| `quantity`       | `Sold Period`                                      |
-| `price`          | `Unit Price`                                       |
-| `unit_cost`      | `Unit Cost`                                        |
-| `cost_sales`     | `Unit Cost * Sold Period`                          |
-| `sales_value`    | `Sales Value`                                      |
+| Transaction field  | Source or synthetic rule                            |
+| ------------------ | --------------------------------------------------- |
+| `transaction_id` | Generated unique sequential ID                       |
+| `timestamp`      | Source month plus a generated valid date and time     |
+| `store_id`       | `BELFAST`                                            |
+| `product_id`     | `Stock Code`                                         |
+| `quantity`       | Source-derived empirical quantity distribution        |
+| `price`          | Product's observed `Unit Price`                       |
+| `unit_cost`      | Product's observed `Unit Cost`                        |
+| `cost_sales`     | `quantity * unit_cost`                                |
+| `sales_value`    | `quantity * price` in synthetic mode                  |
 
-The generator gets the actual number of days in each month and spreads valid
-transactions evenly across those days:
+In original 966-row mode, the generator gets the actual number of days in each
+month and spreads valid source rows evenly across those days:
 
 ```python
 days_in_month = calendar.monthrange(year, month)[1]
@@ -92,7 +151,7 @@ day = ((month_tx_counter - 1) % days_in_month) + 1
 ```
 
 The monthly counter resets for each worksheet. This includes day 29, 30, and
-31 where applicable. With the current 966 source records, the distribution is:
+31 where applicable. The original source-record distribution is:
 
 | Month         | Transactions | Days | Distribution               |
 | ------------- | -----------: | ---: | -------------------------- |
@@ -149,7 +208,7 @@ A successful connection produces logs similar to:
 
 ```text
 Connected to Kafka broker at localhost:9092
-Streamed 966/966 transactions to topic 'sales_transactions'
+Streamed 12000/12000 transactions to topic 'sales_transactions'
 ```
 
 If the log contains `Falling back to local simulation queue`, the records were
@@ -196,8 +255,8 @@ Expected output is similar to:
 
 ```text
 Connected consumer group 'retailbatch-consumer-group' to Kafka broker at localhost:9092
-Consumed 966 valid transactions from topic 'sales_transactions'
-Wrote 966 raw records to data/hdfs_raw/raw_batch_..._966.json
+Consumed 12000 valid transactions from topic 'sales_transactions'
+Wrote 12000 raw records to data/hdfs_raw/raw_batch_..._12000.json
 ```
 
 Consuming a message does not immediately delete it from Kafka or Kafka UI.
@@ -224,9 +283,26 @@ aggregations:
 python run_pipeline.py --produce
 ```
 
+Expected pipeline logs include:
+
+```text
+Streamed 12000/12000 transactions to topic 'sales_transactions'
+Consumed 12000 valid transactions from topic 'sales_transactions'
+Batch-size target met: 12000 transactions (minimum 10000).
+```
+
 Do not use `--produce` merely to check for new messages. Every use republishes
-all 966 sample records, and Kafka assigns them new offsets even when their
-`transaction_id` values are unchanged.
+the complete generated file (normally 12,000 records), and Kafka assigns the
+records new offsets even when their `transaction_id` values are unchanged.
+
+`MIN_BATCH_SIZE` is a 10,000-transaction batch target. The manager logs whether
+the target was met, but it deliberately continues to process smaller
+incremental batches so already-consumed Kafka messages are not discarded.
+
+For a clean repeat demonstration, first archive the existing files under
+`data/hdfs_raw/` and `data/hdfs_output/`. The batch processor reads every raw
+file in `data/hdfs_raw/`, so leaving a previous full batch there would count it
+again in the regenerated summaries.
 
 ### Normal processing of new messages
 
@@ -245,7 +321,7 @@ python -m src.pipeline_manager
 Both commands consume only messages after the named consumer group's last
 committed offset. They do not publish data or create Docker containers.
 
-If 966 messages were previously consumed and 34 new messages arrive, the next
+If 12,000 messages were previously consumed and 34 new messages arrive, the next
 normal run consumes only those 34 messages, writes a new raw batch, and
 regenerates the summaries from the raw directory.
 
@@ -287,12 +363,12 @@ Open [http://localhost:8080](http://localhost:8080), then navigate to:
 RetailBatch -> Topics -> sales_transactions -> Produce Message
 ```
 
-Use `TXN-TEST-000967` as the optional message key and enter this JSON as the
+Use `TXN-TEST-012001` as the optional message key and enter this JSON as the
 message value:
 
 ```json
 {
-  "transaction_id": "TXN-TEST-000967",
+  "transaction_id": "TXN-TEST-012001",
   "timestamp": "2026-02-01T12:00:00Z",
   "store_id": "BELFAST",
   "product_id": "TEST-PRODUCT-001",
@@ -327,8 +403,9 @@ python -m src.pipeline_manager
 ```
 
 Do not use `python run_pipeline.py --produce` for this test because it
-republishes all 966 sample transactions. The consumer waits for 30 seconds
-after the last available message, so the raw file is written after that wait.
+republishes the complete generated file, normally all 12,000 transactions. The
+consumer waits for 30 seconds after the last available message, so the raw file
+is written after that wait.
 
 Expected logs include:
 
@@ -419,9 +496,9 @@ The project currently simulates HDFS with local directories:
 ### The consumer group is already caught up
 
 The named group `retailbatch-consumer-group` commits its Kafka offsets. After
-it consumes the first 966 messages, another pipeline run correctly returns
-zero until a producer publishes newer messages. No action is required; run
-the pipeline again when new messages have arrived.
+it consumes the initial generated batch, another pipeline run correctly
+returns zero until a producer publishes newer messages. No action is required;
+run the pipeline again when new messages have arrived.
 
 ### The producer used the local fallback
 
